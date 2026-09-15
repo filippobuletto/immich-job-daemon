@@ -33,6 +33,66 @@ if ! echo "$POLL_INTERVAL" | grep -qE '^[1-9][0-9]*$'; then
     exit 1
 fi
 
+# --- NTFY Configuration ---
+CONFIG_FILE="${CONFIG_FILE:-.ntfy_config}"
+
+# Required
+TOPIC="${NTFY_TOPIC:-$(grep -E '^TOPIC=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d '\n' | xargs)}"
+
+# Optional: Custom ntfy instance
+BASE_URL="${NTFY_BASE_URL:-$(grep -E '^BASE_URL=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d '\n' | xargs)}"
+BASE_URL="${BASE_URL:-https://ntfy.sh}"
+
+# Optional: Authentication
+AUTH_HEADER=""
+if [ -n "$NTFY_ACCESS_TOKEN" ]; then
+    AUTH_HEADER="Authorization: Bearer $NTFY_ACCESS_TOKEN"
+elif [ -n "$NTFY_BASIC_AUTH" ]; then
+    AUTH_HEADER="Authorization: Basic $NTFY_BASIC_AUTH"
+elif [ -f "$CONFIG_FILE" ]; then
+    ACCESS_TOKEN=$(grep -E '^ACCESS_TOKEN=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d '\n' | xargs)
+    BASIC_AUTH=$(grep -E '^BASIC_AUTH=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d '\n' | xargs)
+    if [ -n "$ACCESS_TOKEN" ]; then
+        AUTH_HEADER="Authorization: Bearer $ACCESS_TOKEN"
+    elif [ -n "$BASIC_AUTH" ]; then
+        AUTH_HEADER="Authorization: Basic $BASIC_AUTH"
+    fi
+fi
+
+# Optional: Notification metadata
+TITLE="${NTFY_TITLE:-$(grep -E '^TITLE=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d '\n' | xargs)}"
+PRIORITY="${NTFY_PRIORITY:-$(grep -E '^PRIORITY=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d '\n' | xargs)}"
+TAGS="${NTFY_TAGS:-$(grep -E '^TAGS=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d '\n' | xargs)}"
+CLICK_ACTION="${NTFY_CLICK_ACTION:-$(grep -E '^CLICK_ACTION=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d '\n' | xargs)}"
+ICON_URL="${NTFY_ICON_URL:-$(grep -E '^ICON_URL=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d '\n' | xargs)}"
+
+# --- Notification Function ---
+send_ntfy_notification() {
+    if [ -z "$TOPIC" ]; then
+        echo "WARN: NTFY_TOPIC is not set in environment or config file." >&2
+        return
+    fi
+
+    local message="${1:-"No Message :placard:"}"
+
+    # Build JSON payload
+    local json_payload="{\"topic\":\"$TOPIC\",\"message\":\"$message\""
+    [ -n "$TITLE" ] && json_payload+=",\"title\":\"$TITLE\""
+    [ -n "$PRIORITY" ] && json_payload+=",\"priority\":$PRIORITY"
+    [ -n "$TAGS" ] && json_payload+=",\"tags\":[\"$TAGS\"]"
+    [ -n "$CLICK_ACTION" ] && json_payload+=",\"click\":\"$CLICK_ACTION\""
+    [ -n "$ICON_URL" ] && json_payload+=",\"icon\":\"$ICON_URL\""
+    json_payload+=",\"actions\":[{\"action\":\"view\",\"label\":\"Open Immich\",\"url\":\"immich://open\",\"clear\":true}]"
+    json_payload+="}"
+
+    # Send notification to ntfy
+    curl -s -X POST \
+        -H "Content-Type: application/json" \
+        -H "$AUTH_HEADER" \
+        -d "$json_payload" \
+        "$BASE_URL" >/dev/null 2>&1
+}
+
 echo "Starting Immich Job Daemon..."
 echo "Immich URL: $IMMICH_URL"
 echo "Max concurrent jobs: $MAX_CONCURRENT_JOBS"
@@ -93,13 +153,13 @@ set_job() {
     local job="$1"
     local command="$2"
     local payload='{"command":"'"$command"'","force":false}'
-    
+
     curl -s -X PUT "$URL/$job" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json" \
     -H "x-api-key: $API_KEY" \
     -d "$payload" >/dev/null 2>&1
-    
+
     if [ $? -ne 0 ]; then
         echo "Error setting job $job to $command" >&2
     fi
@@ -109,17 +169,17 @@ set_job() {
 manage_jobs() {
     # Fetch all jobs from the API
     jobs=$(fetch_jobs)
-    
+
     if [ -z "$jobs" ] || [ "$jobs" = "{}" ]; then
         return
     fi
-    
+
     # List of jobs to manage in priority order
     priority_job_list="sidecar metadataExtraction storageTemplateMigration thumbnailGeneration smartSearch duplicateDetection faceDetection facialRecognition videoConversion"
-    
+
     # Get all available jobs from the API response
     all_jobs=$(echo "$jobs" | jq -r 'keys[]' 2>/dev/null)
-    
+
     # Build complete managed job list: priority jobs first, then other jobs
     # Use grep for faster lookups instead of nested loops
     managed_job_list="$priority_job_list"
@@ -129,33 +189,33 @@ manage_jobs() {
             managed_job_list="$managed_job_list $job"
         fi
     done
-    
+
     # Check if any jobs are currently actively running (active > 0)
     # If yes, don't interrupt them - let them finish
     has_active_jobs=0
     currently_active_jobs=""
-    
+
     for job in $managed_job_list; do
         job_counts=$(echo "$jobs" | jq -r ".$job.jobCounts | \"\(.active // 0) \(.waiting // 0) \(.paused // 0) \(.delayed // 0)\"" 2>/dev/null)
-        
+
         if [ -z "$job_counts" ]; then
             continue
         fi
-        
+
         set -- $job_counts
         active=$1
-        
+
         # If this job has active tasks, don't interrupt it
         if [ "$active" -gt 0 ]; then
             has_active_jobs=1
             currently_active_jobs="$currently_active_jobs $job"
         fi
     done
-    
+
     # Collect jobs with activity and unpause the first N jobs based on MAX_CONCURRENT_JOBS
     jobs_to_unpause=""
     jobs_unpaused=0
-    
+
     # If there are active jobs, keep them running and don't start new ones
     if [ "$has_active_jobs" -eq 1 ]; then
         # Keep currently active jobs running
@@ -170,21 +230,21 @@ manage_jobs() {
         for job in $managed_job_list; do
             # Get all counts in one jq call
             job_counts=$(echo "$jobs" | jq -r ".$job.jobCounts | \"\(.active // 0) \(.waiting // 0) \(.paused // 0) \(.delayed // 0)\"" 2>/dev/null)
-            
+
             if [ -z "$job_counts" ]; then
                 continue
             fi
-            
+
             # Parse the space-separated values
             set -- $job_counts
             active=$1
             waiting=$2
             paused=$3
             delayed=$4
-            
+
             # Calculate total activity in one operation
             total=$((active + waiting + paused + delayed))
-            
+
             if [ "$total" -gt 0 ]; then
                 if [ "$jobs_unpaused" -lt "$MAX_CONCURRENT_JOBS" ]; then
                     jobs_to_unpause="$jobs_to_unpause $job"
@@ -193,10 +253,10 @@ manage_jobs() {
             fi
         done
     fi
-    
+
     # Build new state string for comparison
     new_job_states=""
-    
+
     # Unpause selected jobs, pause all others in managed_job_list
     for job in $managed_job_list; do
         # Use grep for faster lookup (O(n) instead of O(n²))
@@ -205,21 +265,22 @@ manage_jobs() {
         else
             new_state="pause"
         fi
-        
+
         # Add to new state
         new_job_states="${new_job_states}${job}:${new_state},"
-        
+
         # Only execute command and log if state changed
         if ! echo "$PREV_JOB_STATES" | grep -q "${job}:${new_state}"; then
             if [ "$new_state" = "resume" ]; then
                 echo "[$(date '+%Y-%m-%d %H:%M:%S')] ▶️  Resuming job: $job"
+                send_ntfy_notification "▶️  Resumed job $job"
             else
                 echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⏸️  Pausing job: $job"
             fi
             set_job "$job" "$new_state"
         fi
     done
-    
+
     # Update previous state
     PREV_JOB_STATES="$new_job_states"
 }
@@ -236,6 +297,7 @@ trap cleanup TERM INT
 
 # Run the job manager loop
 echo "🚀 Job daemon started. Press Ctrl+C to stop."
+send_ntfy_notification "Immich Job Daemon started."
 echo ""
 while true; do
     if is_active_hour; then
