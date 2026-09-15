@@ -10,7 +10,8 @@ LABEL org.opencontainers.image.licenses="MIT"
 # Install required packages
 RUN apk add --no-cache \
   curl \
-  jq
+  jq \
+  bash
 
 # Create a non-root user to run the daemon
 RUN adduser -D -u 1000 immich

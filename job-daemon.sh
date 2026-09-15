@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 # Configuration for the API endpoint and headers
 # These values should be provided via environment variables
@@ -7,6 +7,10 @@ API_KEY="${API_KEY:-}"
 MAX_CONCURRENT_JOBS="${MAX_CONCURRENT_JOBS:-1}"
 POLL_INTERVAL="${POLL_INTERVAL:-10}"
 URL="${IMMICH_URL}/api/jobs"
+
+# Time window configuration (24-hour format)
+START_HOUR="${START_HOUR:-0}"  # Default: 00:00
+END_HOUR="${END_HOUR:-23}"     # Default: 23:00
 
 # Variable to store previous job states
 PREV_JOB_STATES=""
@@ -33,6 +37,7 @@ echo "Starting Immich Job Daemon..."
 echo "Immich URL: $IMMICH_URL"
 echo "Max concurrent jobs: $MAX_CONCURRENT_JOBS"
 echo "Poll interval: ${POLL_INTERVAL}s"
+echo "Active hours: ${START_HOUR}:00 to ${END_HOUR}:00"
 
 # Check server availability
 echo "Checking Immich server availability..."
@@ -51,17 +56,29 @@ echo "Verifying API key..."
 test_response=$(curl -s -w "%{http_code}" -o /dev/null -X GET "$URL" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json" \
--H "x-api-key: $API_KEY")
+    -H "x-api-key: $API_KEY")
 
 if [ "$test_response" = "401" ] || [ "$test_response" = "403" ]; then
     echo "ERROR: API key is invalid or does not have required permissions" >&2
     echo "Please ensure the API key has 'job.read' and 'job.create' permissions" >&2
     exit 1
-    elif [ "$test_response" != "200" ]; then
+elif [ "$test_response" != "200" ]; then
     echo "WARNING: Unexpected response code: $test_response" >&2
 fi
 echo "✓ API key verified successfully"
 echo ""
+
+# Function to check if current hour is within the active window
+is_active_hour() {
+    local current_hour=$(date +%H)
+    if [ "$START_HOUR" -le "$END_HOUR" ]; then
+        # Normal case: START_HOUR <= END_HOUR (e.g., 08:00 to 18:00)
+        [ "$current_hour" -ge "$START_HOUR" ] && [ "$current_hour" -lt "$END_HOUR" ]
+    else
+        # Wrap-around case: START_HOUR > END_HOUR (e.g., 22:00 to 06:00)
+        [ "$current_hour" -ge "$START_HOUR" ] || [ "$current_hour" -lt "$END_HOUR" ]
+    fi
+}
 
 # Function to fetch the current job statuses from the API
 fetch_jobs() {
@@ -221,6 +238,10 @@ trap cleanup TERM INT
 echo "🚀 Job daemon started. Press Ctrl+C to stop."
 echo ""
 while true; do
-    manage_jobs
+    if is_active_hour; then
+        manage_jobs
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⏳ Skipping: Outside active hours (${START_HOUR}:00-${END_HOUR}:00)"
+    fi
     sleep "$POLL_INTERVAL"
 done
